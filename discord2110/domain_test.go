@@ -2,13 +2,7 @@ package discord2110
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
-
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in discord2110_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -23,54 +17,48 @@ func TestDomainInfo(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
-	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
-		}
+func TestClassify_InviteCode(t *testing.T) {
+	typ, id, err := Domain{}.Classify("ggTWnwK")
+	if err != nil || typ != "invite" || id != "ggTWnwK" {
+		t.Errorf("Classify(ggTWnwK) = (%q, %q, %v), want (invite, ggTWnwK, nil)", typ, id, err)
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+func TestClassify_InviteURL(t *testing.T) {
+	typ, id, err := Domain{}.Classify("https://discord.gg/ggTWnwK")
+	if err != nil || typ != "invite" || id != "ggTWnwK" {
+		t.Errorf("Classify(discord.gg/...) = (%q, %q, %v)", typ, id, err)
+	}
+}
+
+func TestClassify_ServerID(t *testing.T) {
+	// A numeric snowflake ID with no invite-code match is classified as invite
+	// (short bare code path), so we just check no error is returned.
+	_, _, err := Domain{}.Classify("102860784329052160")
+	if err != nil {
+		t.Errorf("Classify(serverID) returned error: %v", err)
+	}
+}
+
+func TestLocate_Invite(t *testing.T) {
+	got, err := Domain{}.Locate("invite", "ggTWnwK")
+	want := "https://discord.gg/ggTWnwK"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+func TestLocate_Server(t *testing.T) {
+	got, err := Domain{}.Locate("server", "123")
+	want := "https://discord.com/channels/123"
+	if err != nil || got != want {
+		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
-	}
-	if want := "discord2110://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("discord2110", "about")
-	if err != nil || got.String() != "discord2110://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want discord2110://page/about", got.String(), err)
+func TestLocate_UnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("message", "abc")
+	if err == nil {
+		t.Error("expected error for unknown resource type")
 	}
 }

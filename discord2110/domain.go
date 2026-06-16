@@ -2,172 +2,154 @@ package discord2110
 
 import (
 	"context"
-	"net/url"
-	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes discord2110 as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/discord2110-cli/discord2110"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// discord2110:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone discord2110 binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the discord2110 driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the Discord archive driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "discord2110",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, "discord.gg"},
 		Identity: kit.Identity{
 			Binary: "discord2110",
 			Short:  "Archive and crawl Discord servers",
-			Long: `Archive and crawl Discord servers
+			Long: `discord2110 archives Discord servers via the Discord REST API v10.
 
-discord2110 reads public discord2110 data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+The invite command is public (no token required).
+The crawl command requires a DISCORD_TOKEN bot token.
+
+Quick start:
+  discord2110 invite ggTWnwK              server metadata from invite code
+  discord2110 invite https://discord.gg/ggTWnwK
+  DISCORD_TOKEN=your-bot-token discord2110 crawl 102860784329052160`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/discord2110-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and all operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `discord2110 page` and
-	// `ant get discord2110://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "invite",
+		Group:   "public",
+		Single:  true,
+		Summary: "Resolve a Discord invite and show server metadata",
+		Args:    []kit.Arg{{Name: "code", Help: "invite code or URL (e.g. ggTWnwK or discord.gg/ggTWnwK)"}},
+	}, getInvite)
 
-	// List op: members of a page, the home of `discord2110 links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// discord2110://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "crawl",
+		Group:   "archive",
+		List:    true,
+		Summary: "Crawl a Discord server and emit its channels and messages",
+		Args:    []kit.Arg{{Name: "server-id", Help: "Discord server (guild) snowflake ID"}},
+	}, crawlServer)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Discord client from the kit-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	dcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		dcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		dcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		dcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		dcfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(dcfg), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type inviteInput struct {
+	Code   string  `kit:"arg"   help:"invite code or URL"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type crawlInput struct {
+	ServerID string  `kit:"arg"          help:"Discord server (guild) ID"`
+	Token    string  `kit:"flag"         help:"Discord bot token (overrides DISCORD_TOKEN env var)"`
+	Channels string  `kit:"flag"         help:"channel filter: text (default) or all"`
+	Limit    int     `kit:"flag,inherit" help:"max messages per channel"`
+	Client   *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+// crawlRecord is a union type emitted by crawl: can be a server, channel, or message.
+// We use Channel as the common emittable since it's a list op.
+func getInvite(ctx context.Context, in inviteInput, emit func(*Server) error) error {
+	srv, err := in.Client.GetInvite(ctx, in.Code)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	return emit(srv)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func crawlServer(ctx context.Context, in crawlInput, emit func(*Channel) error) error {
+	if in.Token != "" {
+		in.Client.cfg.Token = in.Token
+	}
+	if in.Client.cfg.Token == "" {
+		return errs.Usage("DISCORD_TOKEN is required for crawl; set the env var or use --token")
+	}
+
+	channels, err := in.Client.GetChannels(ctx, in.ServerID)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+
+	filterAll := in.Channels == "all"
+	for _, ch := range channels {
+		if !filterAll && !IsTextChannel(ch.Type) {
+			continue
+		}
+		if err := emit(ch); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full discord2110.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify implements the URI resolver interface.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized discord2110 reference: %q", input)
+	if input == "" {
+		return "", "", errs.Usage("discord2110 reference is empty")
 	}
-	return "page", id, nil
+	code := ExtractCode(input)
+	if code != "" {
+		return "invite", code, nil
+	}
+	return "server", input, nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("discord2110 has no resource type %q", uriType)
+	switch uriType {
+	case "invite":
+		return "https://discord.gg/" + id, nil
+	case "server":
+		return "https://discord.com/channels/" + id, nil
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "", errs.Usage("discord2110 has no resource type %q", uriType)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr passes errors through; kit's typed error system handles exit codes.
 func mapErr(err error) error {
 	return err
 }
