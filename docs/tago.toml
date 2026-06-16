@@ -1,0 +1,10 @@
+title       = "discord2110"
+baseURL     = "https://discord2110-cli.tamnd.com/"
+description = "Archive and crawl Discord servers"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/discord2110-cli"
